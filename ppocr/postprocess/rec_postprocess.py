@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import heapq
 
 import numpy as np
 import paddle
@@ -72,11 +73,34 @@ class BaseRecLabelDecode(object):
         result_list = []
         ignored_tokens = self.get_ignored_tokens()
         batch_size = len(text_index)
+
+        # TODO 修改
+        # 官方代码，默认只获取第一个重复项，但没考虑重复项得分是不一样的，导致识别是正确的，但最终得分却异常低。
+        # 修改参考：https://github.com/PaddlePaddle/PaddleOCR/issues/7971
         for batch_idx in range(batch_size):
             selection = np.ones(len(text_index[batch_idx]), dtype=bool)
             if is_remove_duplicate:
-                selection[1:] = text_index[batch_idx][1:] != text_index[
-                    batch_idx][:-1]
+                # 修改前
+                # selection[1:] = text_index[batch_idx][1:] != text_index[
+                #     batch_idx][:-1]
+
+                # 修改后 START
+                text_index_batch = text_index[batch_idx]
+                for i in range(0, len(text_index_batch) - 1):
+                    if text_index_batch[i] == 0 or str(selection[i]) == "False":
+                        selection[i] = False
+                    else:
+                        if text_index_batch[i] != text_index_batch[i+1]:
+                            selection[i] = True
+                        else:
+                            if text_prob[batch_idx][i] > text_prob[batch_idx][i+1]:
+                                selection[i] = True
+                                selection[i+1] = False
+                            else:
+                                selection[i] = False
+                                selection[i+1] = True
+                # END
+
             for ignored_token in ignored_tokens:
                 selection &= text_index[batch_idx] != ignored_token
 
@@ -110,15 +134,37 @@ class CTCLabelDecode(BaseRecLabelDecode):
                  **kwargs):
         super(CTCLabelDecode, self).__init__(character_dict_path,
                                              use_space_char)
-
     def __call__(self, preds, label=None, *args, **kwargs):
         if isinstance(preds, tuple) or isinstance(preds, list):
             preds = preds[-1]
         if isinstance(preds, paddle.Tensor):
             preds = preds.numpy()
+
+        topK = 5  # 我们想要输出K个值，按置信度降序排序
+        # 先预测一个值
         preds_idx = preds.argmax(axis=2)
         preds_prob = preds.max(axis=2)
         text = self.decode(preds_idx, preds_prob, is_remove_duplicate=True)
+        print('*************************')
+        print(text)
+
+        # 再预测topK-1个值
+        # 注意：每输出一个argmax之后就将那里的preds概率改为0（即最小值）
+        # 注意：pred_inx=0的地方不用修改，基本也就只用修改1个值为0即可
+        for cnt in range(topK-1):
+            for i in range(preds[0].shape[0]):
+                k = preds_idx[0][i]
+                if k != 0:
+                    preds[0][i][k] = 0
+            preds_idx = preds.argmax(axis=2)
+            preds_prob = preds.max(axis=2)
+            text = self.decode(preds_idx, preds_prob, is_remove_duplicate=True)
+            print(text)
+
+        print('*************************')
+
+
+
         if label is None:
             return text
         label = self.decode(label)
